@@ -269,6 +269,102 @@ class SD3ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, PeftAdapterMix
 
         return controlnet
 
+    def yield_controlnet_block_samples(
+        self,
+        hidden_states: torch.FloatTensor,
+        controlnet_cond: torch.Tensor,
+        conditioning_scale: float = 1.0,
+        encoder_hidden_states: torch.FloatTensor = None,
+        pooled_projections: torch.FloatTensor = None,
+        timestep: torch.LongTensor = None,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        if joint_attention_kwargs is not None:
+            joint_attention_kwargs = joint_attention_kwargs.copy()
+            lora_scale = joint_attention_kwargs.pop("scale", 1.0)
+        else:
+            lora_scale = 1.0
+
+        if USE_PEFT_BACKEND:
+            # weight the lora layers by setting `lora_scale` for each PEFT layer
+            scale_lora_layers(self, lora_scale)
+        else:
+            if joint_attention_kwargs is not None and joint_attention_kwargs.get("scale", None) is not None:
+                logger.warning(
+                    "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
+                )
+
+        if self.pos_embed is not None and hidden_states.ndim != 4:
+            raise ValueError("hidden_states must be 4D when pos_embed is used")
+
+        # SD3.5 8b controlnet does not have a `pos_embed`,
+        # it use the `pos_embed` from the transformer to process input before passing to controlnet
+        elif self.pos_embed is None and hidden_states.ndim != 3:
+            raise ValueError("hidden_states must be 3D when pos_embed is not used")
+
+        if self.context_embedder is not None and encoder_hidden_states is None:
+            raise ValueError("encoder_hidden_states must be provided when context_embedder is used")
+        # SD3.5 8b controlnet does not have a `context_embedder`, it does not use `encoder_hidden_states`
+        elif self.context_embedder is None and encoder_hidden_states is not None:
+            raise ValueError("encoder_hidden_states should not be provided when context_embedder is not used")
+
+        if self.pos_embed is not None:
+            hidden_states = self.pos_embed(hidden_states)  # takes care of adding positional embeddings too.
+
+        temb = self.time_text_embed(timestep, pooled_projections)
+
+        if self.context_embedder is not None:
+            encoder_hidden_states = self.context_embedder(encoder_hidden_states)
+
+        # add
+        hidden_states = hidden_states + self.pos_embed_input(controlnet_cond)
+
+        block_res_samples = ()
+
+        for block in self.transformer_blocks:
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+
+                def create_custom_forward(module, return_dict=None):
+                    def custom_forward(*inputs):
+                        if return_dict is not None:
+                            return module(*inputs, return_dict=return_dict)
+                        else:
+                            return module(*inputs)
+
+                    return custom_forward
+
+                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                if self.context_embedder is not None:
+                    encoder_hidden_states, hidden_states = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(block),
+                        hidden_states,
+                        encoder_hidden_states,
+                        temb,
+                        **ckpt_kwargs,
+                    )
+                else:
+                    # SD3.5 8b controlnet use single transformer block, which does not use `encoder_hidden_states`
+                    hidden_states = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(block), hidden_states, temb, **ckpt_kwargs
+                    )
+
+            else:
+                if self.context_embedder is not None:
+                    encoder_hidden_states, hidden_states = block(
+                        hidden_states=hidden_states, encoder_hidden_states=encoder_hidden_states, temb=temb
+                    )
+                else:
+                    # SD3.5 8b controlnet use single transformer block, which does not use `encoder_hidden_states`
+                    hidden_states = block(hidden_states, temb)
+
+            block_res_samples = block_res_samples + (hidden_states,)
+
+        for i, (block_res_sample, controlnet_block) in enumerate(zip(block_res_samples, self.controlnet_blocks)):
+            block_res_sample = controlnet_block(block_res_sample) * conditioning_scale
+            yield {
+                f"control_block_sample_{i}": block_res_sample
+            }
+
     @apply_lora_scale("joint_attention_kwargs")
     def forward(
         self,
