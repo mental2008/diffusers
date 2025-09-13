@@ -78,6 +78,12 @@ else:
     _LOW_CPU_MEM_USAGE_DEFAULT = False
 
 
+def get_lazy_tensor(tensor_or_callable: Any) -> torch.Tensor:
+    if callable(tensor_or_callable):
+        return tensor_or_callable()
+    return tensor_or_callable
+
+
 if is_accelerate_available():
     import accelerate
 

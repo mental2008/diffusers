@@ -1,3 +1,5 @@
+import time
+
 import torch
 from diffusers import StableDiffusion3Pipeline
 
@@ -7,7 +9,8 @@ pipe = pipe.to("cuda")
 seed = 666
 sd_generator = torch.manual_seed(seed)
 
-image = pipe(
+# warm up
+pipe(
     prompt="Anime style illustration of a girl wearing a suit.",
     num_inference_steps=28,
     height=1024,
@@ -16,4 +19,16 @@ image = pipe(
     guidance_scale=1.0,
 ).images[0]
 
-image.save("diffusers_sd3.png")
+start_time = time.time()
+image = pipe(
+    prompt="Anime style illustration of a girl wearing a suit.",
+    num_inference_steps=28,
+    height=1024,
+    width=1024,
+    generator=sd_generator,
+    guidance_scale=1.0,
+).images[0]
+end_time = time.time()
+print(f"Time taken to execute model: {end_time - start_time} seconds")
+
+image.save("diffusers_sd3_groundtruth.png")
