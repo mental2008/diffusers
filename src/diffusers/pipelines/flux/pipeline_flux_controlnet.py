@@ -1077,6 +1077,7 @@ class FluxControlNetPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleF
                 batch_size * num_images_per_prompt,
             )
 
+        print(f"do_true_cfg: {do_true_cfg}")
         # 7. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -1119,6 +1120,22 @@ class FluxControlNetPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleF
                     joint_attention_kwargs=self.joint_attention_kwargs,
                     return_dict=False,
                 )
+
+                if do_true_cfg:
+                    _, _ = self.controlnet(
+                        hidden_states=latents,
+                        controlnet_cond=control_image,
+                        controlnet_mode=control_mode,
+                        conditioning_scale=cond_scale,
+                        timestep=timestep / 1000,
+                        guidance=guidance,
+                        pooled_projections=pooled_prompt_embeds,
+                        encoder_hidden_states=prompt_embeds,
+                        txt_ids=text_ids,
+                        img_ids=latent_image_ids,
+                        joint_attention_kwargs=self.joint_attention_kwargs,
+                        return_dict=False,
+                    )
 
                 guidance = (
                     torch.tensor([guidance_scale], device=device) if self.transformer.config.guidance_embeds else None
