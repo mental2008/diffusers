@@ -760,24 +760,13 @@ class FluxTransformer2DModel(
 
         for index_block, block in enumerate(self.transformer_blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
-
-                def create_custom_forward(module, return_dict=None):
-                    def custom_forward(*inputs):
-                        if return_dict is not None:
-                            return module(*inputs, return_dict=return_dict)
-                        else:
-                            return module(*inputs)
-
-                    return custom_forward
-
-                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                encoder_hidden_states, hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
+                encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
+                    block,
                     hidden_states,
                     encoder_hidden_states,
                     temb,
                     image_rotary_emb,
-                    **ckpt_kwargs,
+                    joint_attention_kwargs,
                 )
 
             else:
@@ -800,32 +789,22 @@ class FluxTransformer2DModel(
                     )
                 else:
                     hidden_states = hidden_states + get_lazy_tensor(controlnet_block_samples[index_block // interval_control])
-        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
         for index_block, block in enumerate(self.single_transformer_blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
-
-                def create_custom_forward(module, return_dict=None):
-                    def custom_forward(*inputs):
-                        if return_dict is not None:
-                            return module(*inputs, return_dict=return_dict)
-                        else:
-                            return module(*inputs)
-
-                    return custom_forward
-
-                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
+                encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
+                    block,
                     hidden_states,
+                    encoder_hidden_states,
                     temb,
                     image_rotary_emb,
-                    **ckpt_kwargs,
+                    joint_attention_kwargs,
                 )
 
             else:
-                hidden_states = block(
+                encoder_hidden_states, hidden_states = block(
                     hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
                     temb=temb,
                     image_rotary_emb=image_rotary_emb,
                     joint_attention_kwargs=joint_attention_kwargs,
@@ -835,12 +814,7 @@ class FluxTransformer2DModel(
             if controlnet_single_block_samples is not None:
                 interval_control = len(self.single_transformer_blocks) / len(controlnet_single_block_samples)
                 interval_control = int(np.ceil(interval_control))
-                hidden_states[:, encoder_hidden_states.shape[1] :, ...] = (
-                    hidden_states[:, encoder_hidden_states.shape[1] :, ...]
-                    + get_lazy_tensor(controlnet_single_block_samples[index_block // interval_control])
-                )
-
-        hidden_states = hidden_states[:, encoder_hidden_states.shape[1] :, ...]
+                hidden_states = hidden_states + get_lazy_tensor(controlnet_single_block_samples[index_block // interval_control])
 
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
