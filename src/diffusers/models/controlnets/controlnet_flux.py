@@ -283,6 +283,7 @@ class FluxControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             controlnet_cond = controlnet_cond.permute(0, 2, 4, 1, 3, 5)
             controlnet_cond = controlnet_cond.reshape(batch_size, height * width, -1)
         # add
+        print(f"hidden_states shape: {hidden_states.shape} controlnet_cond shape: {controlnet_cond.shape} self.controlnet_x_embedder shape: {self.controlnet_x_embedder.weight.shape}")
         hidden_states = hidden_states + self.controlnet_x_embedder(controlnet_cond)
 
         timestep = timestep.to(hidden_states.dtype) * 1000

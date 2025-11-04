@@ -166,18 +166,46 @@ def load_state_dict(
         return checkpoint_file
     try:
         file_extension = os.path.basename(checkpoint_file).split(".")[-1]
+        use_pin_memory = os.environ.get("USE_PIN_MEMORY", "false").lower() == 'true'
         if file_extension == SAFETENSORS_FILE_EXTENSION:
             if dduf_entries:
                 # tensors are loaded on cpu
                 with dduf_entries[checkpoint_file].as_mmap() as mm:
-                    return safetensors.torch.load(mm)
+                    if use_pin_memory:
+                        tensors = safetensors.torch.load(mm)
+                        for k, v in tensors.items():
+                            tensors[k] = v.contiguous().pin_memory()
+                            assert tensors[k].is_pinned()
+                        return tensors
+                    else:
+                        return safetensors.torch.load(mm)
             if disable_mmap:
-                return safetensors.torch.load(open(checkpoint_file, "rb").read())
+                tensors = safetensors.torch.load(open(checkpoint_file, "rb").read())
+                # Pin memory for faster transfer to GPU 
+                if not use_pin_memory:
+                    return tensors
+                for k, v in tensors.items():
+                    tensors[k] = v.contiguous().pin_memory()
+                    assert tensors[k].is_pinned()
+                    
+                
+                return tensors
             else:
-                return safetensors.torch.load_file(checkpoint_file, device=map_location)
+                tensors = safetensors.torch.load_file(checkpoint_file, device=map_location)
+                if not use_pin_memory:
+                    return tensors
+                # Pin memory for faster transfer to GPU
+                for k, v in tensors.items():
+                    tensors[k] = v.contiguous().pin_memory()
+                    assert tensors[k].is_pinned()
+                    
+
+                return tensors
         elif file_extension == GGUF_FILE_EXTENSION:
+            print("Loading GGUF checkpoint")
             return load_gguf_checkpoint(checkpoint_file)
         else:
+            print("Loading PyTorch checkpoint")
             extra_args = {}
             weights_only_kwarg = {"weights_only": True} if is_torch_version(">=", "1.13") else {}
             # mmap can only be used with files serialized with zipfile-based format.
@@ -270,7 +298,7 @@ def load_model_dict_into_meta(
 
         if old_param is not None:
             if dtype is None:
-                param = param.to(old_param.dtype)
+                param = param.to(old_param.dtype).pin_memory()
 
             if old_param.is_contiguous():
                 param = param.contiguous()
