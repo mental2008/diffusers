@@ -1587,13 +1587,13 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         # print("diffusers pinning parameters")
         import os
 
-        # # if os.getenv("USE_PIN_MEMORY") == "true":
-        # for name, param in model.named_parameters():
-        #     param.data = param.data.contiguous().pin_memory()
-        #     assert param.is_pinned() == True, f"Parameter {name} is not pinned"
-        # for name, buffer in model.named_buffers():
-        #     buffer.data = buffer.data.contiguous().pin_memory()
-        #     assert buffer.is_pinned() == True, f"Buffer {name} is not pinned"
+        # if os.getenv("USE_PIN_MEMORY") == "true":
+        for name, param in model.named_parameters():
+            param.data = param.data.contiguous().pin_memory()
+            assert param.is_pinned() == True, f"Parameter {name} is not pinned"
+        for name, buffer in model.named_buffers():
+            buffer.data = buffer.data.contiguous().pin_memory()
+            assert buffer.is_pinned() == True, f"Buffer {name} is not pinned"
 
         empty_device_cache()
 
