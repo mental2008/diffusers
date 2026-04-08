@@ -125,6 +125,9 @@ dmypy.json
 .vs
 .vscode
 
+# Cursor
+.cursor
+
 # Pycharm
 .idea
 
@@ -176,3 +179,9 @@ tags
 
 # wandb
 wandb
+
+# AI agent generated symlinks
+/AGENTS.md
+/CLAUDE.md
+/.agents/skills
+/.claude/skills

@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional, Union
-
 import torch
 
 from ...image_processor import PipelineImageInput
@@ -31,7 +29,7 @@ logger = get_logger(__name__)  # pylint: disable=invalid-name
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.retrieve_latents
 def retrieve_latents(
-    encoder_output: torch.Tensor, generator: Optional[torch.Generator] = None, sample_mode: str = "sample"
+    encoder_output: torch.Tensor, generator: torch.Generator | None = None, sample_mode: str = "sample"
 ):
     if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
         return encoder_output.latent_dist.sample(generator)
@@ -65,12 +63,12 @@ class LTXLatentUpsamplePipeline(DiffusionPipeline):
 
     def prepare_latents(
         self,
-        video: Optional[torch.Tensor] = None,
+        video: torch.Tensor | None = None,
         batch_size: int = 1,
-        dtype: Optional[torch.dtype] = None,
-        device: Optional[torch.device] = None,
-        generator: Optional[torch.Generator] = None,
-        latents: Optional[torch.Tensor] = None,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+        generator: torch.Generator | None = None,
+        latents: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if latents is not None:
             return latents.to(device=device, dtype=dtype)
@@ -120,6 +118,38 @@ class LTXLatentUpsamplePipeline(DiffusionPipeline):
 
         result = torch.lerp(latents, result, factor)
         return result
+
+    def tone_map_latents(self, latents: torch.Tensor, compression: float) -> torch.Tensor:
+        """
+        Applies a non-linear tone-mapping function to latent values to reduce their dynamic range in a perceptually
+        smooth way using a sigmoid-based compression.
+
+        This is useful for regularizing high-variance latents or for conditioning outputs during generation, especially
+        when controlling dynamic behavior with a `compression` factor.
+
+        Args:
+            latents : torch.Tensor
+                Input latent tensor with arbitrary shape. Expected to be roughly in [-1, 1] or [0, 1] range.
+            compression : float
+                Compression strength in the range [0, 1].
+                - 0.0: No tone-mapping (identity transform)
+                - 1.0: Full compression effect
+
+        Returns:
+            torch.Tensor
+                The tone-mapped latent tensor of the same shape as input.
+        """
+        # Remap [0-1] to [0-0.75] and apply sigmoid compression in one shot
+        scale_factor = compression * 0.75
+        abs_latents = torch.abs(latents)
+
+        # Sigmoid compression: sigmoid shifts large values toward 0.2, small values stay ~1.0
+        # When scale_factor=0, sigmoid term vanishes, when scale_factor=0.75, full effect
+        sigmoid_term = torch.sigmoid(4.0 * scale_factor * (abs_latents - 1.0))
+        scales = 1.0 - 0.8 * scale_factor * sigmoid_term
+
+        filtered = latents * scales
+        return filtered
 
     @staticmethod
     # Copied from diffusers.pipelines.ltx.pipeline_ltx.LTXPipeline._normalize_latents
@@ -196,7 +226,7 @@ class LTXLatentUpsamplePipeline(DiffusionPipeline):
         )
         self.vae.disable_tiling()
 
-    def check_inputs(self, video, height, width, latents):
+    def check_inputs(self, video, height, width, latents, tone_map_compression_ratio):
         if height % self.vae_spatial_compression_ratio != 0 or width % self.vae_spatial_compression_ratio != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 32 but are {height} and {width}.")
 
@@ -205,18 +235,22 @@ class LTXLatentUpsamplePipeline(DiffusionPipeline):
         if video is None and latents is None:
             raise ValueError("One of `video` or `latents` has to be provided.")
 
+        if not (0 <= tone_map_compression_ratio <= 1):
+            raise ValueError("`tone_map_compression_ratio` must be in the range [0, 1]")
+
     @torch.no_grad()
     def __call__(
         self,
-        video: Optional[List[PipelineImageInput]] = None,
+        video: list[PipelineImageInput] | None = None,
         height: int = 512,
         width: int = 704,
-        latents: Optional[torch.Tensor] = None,
-        decode_timestep: Union[float, List[float]] = 0.0,
-        decode_noise_scale: Optional[Union[float, List[float]]] = None,
+        latents: torch.Tensor | None = None,
+        decode_timestep: float | list[float] = 0.0,
+        decode_noise_scale: float | list[float] | None = None,
         adain_factor: float = 0.0,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        output_type: Optional[str] = "pil",
+        tone_map_compression_ratio: float = 0.0,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        output_type: str | None = "pil",
         return_dict: bool = True,
     ):
         self.check_inputs(
@@ -224,6 +258,7 @@ class LTXLatentUpsamplePipeline(DiffusionPipeline):
             height=height,
             width=width,
             latents=latents,
+            tone_map_compression_ratio=tone_map_compression_ratio,
         )
 
         if video is not None:
@@ -265,6 +300,9 @@ class LTXLatentUpsamplePipeline(DiffusionPipeline):
             latents = self.adain_filter_latent(latents_upsampled, latents, adain_factor)
         else:
             latents = latents_upsampled
+
+        if tone_map_compression_ratio > 0.0:
+            latents = self.tone_map_latents(latents, tone_map_compression_ratio)
 
         if output_type == "latent":
             latents = self._normalize_latents(

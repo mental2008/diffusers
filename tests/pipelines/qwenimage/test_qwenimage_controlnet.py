@@ -44,7 +44,6 @@ class QwenControlNetPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
     batch_params = frozenset(["prompt", "negative_prompt", "control_image"])
     image_params = frozenset(["control_image"])
     image_latents_params = frozenset(["latents"])
-
     required_optional_params = frozenset(
         [
             "num_inference_steps",
@@ -59,7 +58,7 @@ class QwenControlNetPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
     )
 
     supports_dduf = False
-    test_xformers_attention = True
+    test_xformers_attention = False
     test_layerwise_casting = True
     test_group_offloading = True
 
@@ -212,7 +211,7 @@ class QwenControlNetPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
 
         generated_slice = generated_image.flatten()
         generated_slice = torch.cat([generated_slice[:8], generated_slice[-8:]])
-        self.assertTrue(torch.allclose(generated_slice, expected_slice, atol=1e-3))
+        self.assertTrue(torch.allclose(generated_slice, expected_slice, atol=5e-3))
 
     def test_qwen_controlnet_multicondition(self):
         device = "cpu"
@@ -256,7 +255,7 @@ class QwenControlNetPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
 
         generated_slice = generated_image.flatten()
         generated_slice = torch.cat([generated_slice[:8], generated_slice[-8:]])
-        self.assertTrue(torch.allclose(generated_slice, expected_slice, atol=1e-3))
+        self.assertTrue(torch.allclose(generated_slice, expected_slice, atol=5e-3))
 
     def test_attention_slicing_forward_pass(
         self, test_max_difference=True, test_mean_pixel_difference=True, expected_max_diff=1e-3

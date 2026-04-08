@@ -28,7 +28,6 @@ from diffusers.utils.import_utils import is_peft_available
 
 from ..testing_utils import (
     floats_tensor,
-    is_flaky,
     require_peft_backend,
     require_peft_version_greater,
     skip_mps,
@@ -46,11 +45,9 @@ from .utils import PeftLoraLoaderMixinTests  # noqa: E402
 
 @require_peft_backend
 @skip_mps
-@is_flaky(max_attempts=10, description="very flaky class")
 class WanVACELoRATests(unittest.TestCase, PeftLoraLoaderMixinTests):
     pipeline_class = WanVACEPipeline
     scheduler_cls = FlowMatchEulerDiscreteScheduler
-    scheduler_classes = [FlowMatchEulerDiscreteScheduler]
     scheduler_kwargs = {}
 
     transformer_kwargs = {
@@ -74,8 +71,8 @@ class WanVACELoRATests(unittest.TestCase, PeftLoraLoaderMixinTests):
         "base_dim": 3,
         "z_dim": 4,
         "dim_mult": [1, 1, 1, 1],
-        "latents_mean": torch.randn(4).numpy().tolist(),
-        "latents_std": torch.randn(4).numpy().tolist(),
+        "latents_mean": [-0.7571, -0.7089, -0.9113, -0.7245],
+        "latents_std": [2.8184, 1.4541, 2.3275, 2.6558],
         "num_res_blocks": 1,
         "temperal_downsample": [False, True, True],
     }
@@ -85,6 +82,8 @@ class WanVACELoRATests(unittest.TestCase, PeftLoraLoaderMixinTests):
     text_encoder_cls, text_encoder_id = T5EncoderModel, "hf-internal-testing/tiny-random-t5"
 
     text_encoder_target_modules = ["q", "k", "v", "o"]
+
+    supports_text_encoder_loras = False
 
     @property
     def output_shape(self):
@@ -140,38 +139,17 @@ class WanVACELoRATests(unittest.TestCase, PeftLoraLoaderMixinTests):
     def test_modify_padding_mode(self):
         pass
 
-    @unittest.skip("Text encoder LoRA is not supported in Wan VACE.")
-    def test_simple_inference_with_partial_text_lora(self):
-        pass
-
-    @unittest.skip("Text encoder LoRA is not supported in Wan VACE.")
-    def test_simple_inference_with_text_lora(self):
-        pass
-
-    @unittest.skip("Text encoder LoRA is not supported in Wan VACE.")
-    def test_simple_inference_with_text_lora_and_scale(self):
-        pass
-
-    @unittest.skip("Text encoder LoRA is not supported in Wan VACE.")
-    def test_simple_inference_with_text_lora_fused(self):
-        pass
-
-    @unittest.skip("Text encoder LoRA is not supported in Wan VACE.")
-    def test_simple_inference_with_text_lora_save_load(self):
-        pass
-
     def test_layerwise_casting_inference_denoiser(self):
         super().test_layerwise_casting_inference_denoiser()
 
     @require_peft_version_greater("0.13.2")
     def test_lora_exclude_modules_wanvace(self):
-        scheduler_cls = self.scheduler_classes[0]
         exclude_module_name = "vace_blocks.0.proj_out"
-        components, text_lora_config, denoiser_lora_config = self.get_dummy_components(scheduler_cls)
+        components, text_lora_config, denoiser_lora_config = self.get_dummy_components()
         pipe = self.pipeline_class(**components).to(torch_device)
         _, _, inputs = self.get_dummy_inputs(with_generator=False)
 
-        output_no_lora = pipe(**inputs, generator=torch.manual_seed(0))[0]
+        output_no_lora = self.get_base_pipe_output()
         self.assertTrue(output_no_lora.shape == self.output_shape)
 
         # only supported for `denoiser` now

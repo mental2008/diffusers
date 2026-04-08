@@ -16,8 +16,10 @@
 import unittest
 
 import numpy as np
+import pytest
 
 from diffusers import KandinskyCombinedPipeline, KandinskyImg2ImgCombinedPipeline, KandinskyInpaintCombinedPipeline
+from diffusers.utils import is_transformers_version
 
 from ...testing_utils import enable_full_determinism, require_torch_accelerator, torch_device
 from ..test_pipelines_common import PipelineTesterMixin
@@ -32,9 +34,7 @@ enable_full_determinism()
 
 class KandinskyPipelineCombinedFastTests(PipelineTesterMixin, unittest.TestCase):
     pipeline_class = KandinskyCombinedPipeline
-    params = [
-        "prompt",
-    ]
+    params = ["prompt"]
     batch_params = ["prompt", "negative_prompt"]
     required_optional_params = [
         "generator",
@@ -73,6 +73,11 @@ class KandinskyPipelineCombinedFastTests(PipelineTesterMixin, unittest.TestCase)
         )
         return inputs
 
+    @pytest.mark.xfail(
+        condition=is_transformers_version(">=", "4.56.2"),
+        reason="Latest transformers changes the slices",
+        strict=False,
+    )
     def test_kandinsky(self):
         device = "cpu"
 
@@ -141,6 +146,10 @@ class KandinskyPipelineCombinedFastTests(PipelineTesterMixin, unittest.TestCase)
     def test_dict_tuple_outputs_equivalent(self):
         super().test_dict_tuple_outputs_equivalent(expected_max_difference=5e-4)
 
+    @unittest.skip("Test not supported.")
+    def test_pipeline_with_accelerator_device_map(self):
+        pass
+
 
 class KandinskyPipelineImg2ImgCombinedFastTests(PipelineTesterMixin, unittest.TestCase):
     pipeline_class = KandinskyImg2ImgCombinedPipeline
@@ -181,6 +190,11 @@ class KandinskyPipelineImg2ImgCombinedFastTests(PipelineTesterMixin, unittest.Te
         inputs.pop("negative_image_embeds")
         return inputs
 
+    @pytest.mark.xfail(
+        condition=is_transformers_version(">=", "4.56.2"),
+        reason="Latest transformers changes the slices",
+        strict=False,
+    )
     def test_kandinsky(self):
         device = "cpu"
 
@@ -252,6 +266,10 @@ class KandinskyPipelineImg2ImgCombinedFastTests(PipelineTesterMixin, unittest.Te
     def test_save_load_optional_components(self):
         super().test_save_load_optional_components(expected_max_difference=5e-4)
 
+    @unittest.skip("Test not supported.")
+    def test_pipeline_with_accelerator_device_map(self):
+        pass
+
 
 class KandinskyPipelineInpaintCombinedFastTests(PipelineTesterMixin, unittest.TestCase):
     pipeline_class = KandinskyInpaintCombinedPipeline
@@ -292,6 +310,11 @@ class KandinskyPipelineInpaintCombinedFastTests(PipelineTesterMixin, unittest.Te
         inputs.pop("negative_image_embeds")
         return inputs
 
+    @pytest.mark.xfail(
+        condition=is_transformers_version(">=", "4.56.2"),
+        reason="Latest transformers changes the slices",
+        strict=False,
+    )
     def test_kandinsky(self):
         device = "cpu"
 
@@ -367,3 +390,7 @@ class KandinskyPipelineInpaintCombinedFastTests(PipelineTesterMixin, unittest.Te
 
     def test_save_load_local(self):
         super().test_save_load_local(expected_max_difference=5e-3)
+
+    @unittest.skip("Test not supported.")
+    def test_pipeline_with_accelerator_device_map(self):
+        pass

@@ -40,6 +40,7 @@ except OptionalDependencyNotAvailable:
 else:
     _import_structure["deprecated"] = ["KarrasVeScheduler", "ScoreSdeVpScheduler"]
     _import_structure["scheduling_amused"] = ["AmusedScheduler"]
+    _import_structure["scheduling_block_refinement"] = ["BlockRefinementScheduler", "BlockRefinementSchedulerOutput"]
     _import_structure["scheduling_consistency_decoder"] = ["ConsistencyDecoderScheduler"]
     _import_structure["scheduling_consistency_models"] = ["CMStochasticIterativeScheduler"]
     _import_structure["scheduling_ddim"] = ["DDIMScheduler"]
@@ -61,11 +62,14 @@ else:
     _import_structure["scheduling_flow_match_euler_discrete"] = ["FlowMatchEulerDiscreteScheduler"]
     _import_structure["scheduling_flow_match_heun_discrete"] = ["FlowMatchHeunDiscreteScheduler"]
     _import_structure["scheduling_flow_match_lcm"] = ["FlowMatchLCMScheduler"]
+    _import_structure["scheduling_helios"] = ["HeliosScheduler"]
+    _import_structure["scheduling_helios_dmd"] = ["HeliosDMDScheduler"]
     _import_structure["scheduling_heun_discrete"] = ["HeunDiscreteScheduler"]
     _import_structure["scheduling_ipndm"] = ["IPNDMScheduler"]
     _import_structure["scheduling_k_dpm_2_ancestral_discrete"] = ["KDPM2AncestralDiscreteScheduler"]
     _import_structure["scheduling_k_dpm_2_discrete"] = ["KDPM2DiscreteScheduler"]
     _import_structure["scheduling_lcm"] = ["LCMScheduler"]
+    _import_structure["scheduling_ltx_euler_ancestral_rf"] = ["LTXEulerAncestralRFScheduler"]
     _import_structure["scheduling_pndm"] = ["PNDMScheduler"]
     _import_structure["scheduling_repaint"] = ["RePaintScheduler"]
     _import_structure["scheduling_sasolver"] = ["SASolverScheduler"]
@@ -142,6 +146,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
     else:
         from .deprecated import KarrasVeScheduler, ScoreSdeVpScheduler
         from .scheduling_amused import AmusedScheduler
+        from .scheduling_block_refinement import BlockRefinementScheduler, BlockRefinementSchedulerOutput
         from .scheduling_consistency_decoder import ConsistencyDecoderScheduler
         from .scheduling_consistency_models import CMStochasticIterativeScheduler
         from .scheduling_ddim import DDIMScheduler
@@ -163,11 +168,14 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
         from .scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
         from .scheduling_flow_match_heun_discrete import FlowMatchHeunDiscreteScheduler
         from .scheduling_flow_match_lcm import FlowMatchLCMScheduler
+        from .scheduling_helios import HeliosScheduler
+        from .scheduling_helios_dmd import HeliosDMDScheduler
         from .scheduling_heun_discrete import HeunDiscreteScheduler
         from .scheduling_ipndm import IPNDMScheduler
         from .scheduling_k_dpm_2_ancestral_discrete import KDPM2AncestralDiscreteScheduler
         from .scheduling_k_dpm_2_discrete import KDPM2DiscreteScheduler
         from .scheduling_lcm import LCMScheduler
+        from .scheduling_ltx_euler_ancestral_rf import LTXEulerAncestralRFScheduler
         from .scheduling_pndm import PNDMScheduler
         from .scheduling_repaint import RePaintScheduler
         from .scheduling_sasolver import SASolverScheduler

@@ -24,7 +24,6 @@ import sys
 import threading
 from pathlib import Path
 from types import ModuleType
-from typing import Dict, Optional, Union
 from urllib import request
 
 from huggingface_hub import hf_hub_download, model_info
@@ -65,7 +64,7 @@ def init_hf_modules():
         init_path.touch()
 
 
-def create_dynamic_module(name: Union[str, os.PathLike]):
+def create_dynamic_module(name: str | os.PathLike):
     """
     Creates a dynamic module in the cache directory for modules.
     """
@@ -151,8 +150,8 @@ def check_imports(filename):
             missing_packages.append(imp)
 
     if len(missing_packages) > 0:
-        raise ImportError(
-            "This modeling file requires the following packages that were not found in your environment: "
+        logger.warning(
+            "This modeling file might require the following packages that were not found in your environment: "
             f"{', '.join(missing_packages)}. Run `pip install {' '.join(missing_packages)}`"
         )
 
@@ -197,7 +196,7 @@ def get_class_in_module(class_name, module_path, force_reload=False):
         if force_reload:
             sys.modules.pop(name, None)
             importlib.invalidate_caches()
-        cached_module: Optional[ModuleType] = sys.modules.get(name)
+        cached_module: ModuleType | None = sys.modules.get(name)
         module_spec = importlib.util.spec_from_file_location(name, location=module_file)
 
         module: ModuleType
@@ -245,14 +244,16 @@ def find_pipeline_class(loaded_module):
 
 @validate_hf_hub_args
 def get_cached_module_file(
-    pretrained_model_name_or_path: Union[str, os.PathLike],
+    pretrained_model_name_or_path: str | os.PathLike,
     module_file: str,
-    cache_dir: Optional[Union[str, os.PathLike]] = None,
+    subfolder: str | None = None,
+    cache_dir: str | os.PathLike | None = None,
     force_download: bool = False,
-    proxies: Optional[Dict[str, str]] = None,
-    token: Optional[Union[bool, str]] = None,
-    revision: Optional[str] = None,
+    proxies: dict[str, str] | None = None,
+    token: bool | str | None = None,
+    revision: str | None = None,
     local_files_only: bool = False,
+    local_dir: str | None = None,
 ):
     """
     Prepares Downloads a module from a local folder or a distant repo and returns its path inside the cached
@@ -276,7 +277,7 @@ def get_cached_module_file(
         force_download (`bool`, *optional*, defaults to `False`):
             Whether or not to force to (re-)download the configuration files and override the cached versions if they
             exist.
-        proxies (`Dict[str, str]`, *optional*):
+        proxies (`dict[str, str]`, *optional*):
             A dictionary of proxy servers to use by protocol or endpoint, e.g., `{'http': 'foo.bar:3128',
             'http://hostname': 'foo.bar:4012'}.` The proxies are used on each request.
         token (`str` or *bool*, *optional*):
@@ -289,12 +290,8 @@ def get_cached_module_file(
         local_files_only (`bool`, *optional*, defaults to `False`):
             If `True`, will only try to load the tokenizer configuration from local files.
 
-    <Tip>
-
-    You may pass a token in `token` if you are not logged in (`hf auth login`) and want to use private or [gated
-    models](https://huggingface.co/docs/hub/models-gated#gated-models).
-
-    </Tip>
+    > [!TIP] > You may pass a token in `token` if you are not logged in (`hf auth login`) and want to use private or
+    [gated > models](https://huggingface.co/docs/hub/models-gated#gated-models).
 
     Returns:
         `str`: The path to the module inside the cache.
@@ -302,7 +299,10 @@ def get_cached_module_file(
     # Download and cache module_file from the repo `pretrained_model_name_or_path` of grab it if it's a local file.
     pretrained_model_name_or_path = str(pretrained_model_name_or_path)
 
-    module_file_or_url = os.path.join(pretrained_model_name_or_path, module_file)
+    if subfolder is not None:
+        module_file_or_url = os.path.join(pretrained_model_name_or_path, subfolder, module_file)
+    else:
+        module_file_or_url = os.path.join(pretrained_model_name_or_path, module_file)
 
     if os.path.isfile(module_file_or_url):
         resolved_module_file = module_file_or_url
@@ -335,6 +335,7 @@ def get_cached_module_file(
                 force_download=force_download,
                 proxies=proxies,
                 local_files_only=local_files_only,
+                local_dir=local_dir,
             )
             submodule = "git"
             module_file = pretrained_model_name_or_path + ".py"
@@ -353,10 +354,13 @@ def get_cached_module_file(
             resolved_module_file = hf_hub_download(
                 pretrained_model_name_or_path,
                 module_file,
+                subfolder=subfolder,
                 cache_dir=cache_dir,
                 force_download=force_download,
                 proxies=proxies,
                 local_files_only=local_files_only,
+                local_dir=local_dir,
+                revision=revision,
                 token=token,
             )
             submodule = os.path.join("local", "--".join(pretrained_model_name_or_path.split("/")))
@@ -383,7 +387,11 @@ def get_cached_module_file(
                 if not os.path.exists(submodule_path / module_folder):
                     os.makedirs(submodule_path / module_folder)
             module_needed = f"{module_needed}.py"
-            shutil.copyfile(os.path.join(pretrained_model_name_or_path, module_needed), submodule_path / module_needed)
+            if subfolder is not None:
+                source_path = os.path.join(pretrained_model_name_or_path, subfolder, module_needed)
+            else:
+                source_path = os.path.join(pretrained_model_name_or_path, module_needed)
+            shutil.copyfile(source_path, submodule_path / module_needed)
     else:
         # Get the commit hash
         # TODO: we will get this info in the etag soon, so retrieve it from there and not here.
@@ -410,38 +418,37 @@ def get_cached_module_file(
                 get_cached_module_file(
                     pretrained_model_name_or_path,
                     f"{module_needed}.py",
+                    subfolder=subfolder,
                     cache_dir=cache_dir,
                     force_download=force_download,
                     proxies=proxies,
                     token=token,
                     revision=revision,
                     local_files_only=local_files_only,
+                    local_dir=local_dir,
                 )
     return os.path.join(full_submodule, module_file)
 
 
 @validate_hf_hub_args
 def get_class_from_dynamic_module(
-    pretrained_model_name_or_path: Union[str, os.PathLike],
+    pretrained_model_name_or_path: str | os.PathLike,
     module_file: str,
-    class_name: Optional[str] = None,
-    cache_dir: Optional[Union[str, os.PathLike]] = None,
+    subfolder: str | None = None,
+    class_name: str | None = None,
+    cache_dir: str | os.PathLike | None = None,
     force_download: bool = False,
-    proxies: Optional[Dict[str, str]] = None,
-    token: Optional[Union[bool, str]] = None,
-    revision: Optional[str] = None,
+    proxies: dict[str, str] | None = None,
+    token: bool | str | None = None,
+    revision: str | None = None,
     local_files_only: bool = False,
-    **kwargs,
+    local_dir: str | None = None,
 ):
     """
     Extracts a class from a module file, present in the local folder or repository of a model.
 
-    <Tip warning={true}>
-
-    Calling this function will execute the code in the module file found locally or downloaded from the Hub. It should
-    therefore only be called on trusted repos.
-
-    </Tip>
+    > [!WARNING] > Calling this function will execute the code in the module file found locally or downloaded from the
+    Hub. It should > therefore only be called on trusted repos.
 
     Args:
         pretrained_model_name_or_path (`str` or `os.PathLike`):
@@ -463,7 +470,7 @@ def get_class_from_dynamic_module(
         force_download (`bool`, *optional*, defaults to `False`):
             Whether or not to force to (re-)download the configuration files and override the cached versions if they
             exist.
-        proxies (`Dict[str, str]`, *optional*):
+        proxies (`dict[str, str]`, *optional*):
             A dictionary of proxy servers to use by protocol or endpoint, e.g., `{'http': 'foo.bar:3128',
             'http://hostname': 'foo.bar:4012'}.` The proxies are used on each request.
         token (`str` or `bool`, *optional*):
@@ -476,12 +483,8 @@ def get_class_from_dynamic_module(
         local_files_only (`bool`, *optional*, defaults to `False`):
             If `True`, will only try to load the tokenizer configuration from local files.
 
-    <Tip>
-
-    You may pass a token in `token` if you are not logged in (`hf auth login`) and want to use private or [gated
-    models](https://huggingface.co/docs/hub/models-gated#gated-models).
-
-    </Tip>
+    > [!TIP] > You may pass a token in `token` if you are not logged in (`hf auth login`) and want to use private or
+    [gated > models](https://huggingface.co/docs/hub/models-gated#gated-models).
 
     Returns:
         `type`: The class, dynamically imported from the module.
@@ -497,11 +500,13 @@ def get_class_from_dynamic_module(
     final_module = get_cached_module_file(
         pretrained_model_name_or_path,
         module_file,
+        subfolder=subfolder,
         cache_dir=cache_dir,
         force_download=force_download,
         proxies=proxies,
         token=token,
         revision=revision,
         local_files_only=local_files_only,
+        local_dir=local_dir,
     )
     return get_class_in_module(class_name, final_module)
