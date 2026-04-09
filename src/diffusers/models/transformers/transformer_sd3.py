@@ -11,14 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any
+from typing import Any, List, Optional, Union, Dict
 
 import torch
 import torch.nn as nn
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import FromOriginalModelMixin, PeftAdapterMixin, SD3Transformer2DLoadersMixin
-from ...utils import apply_lora_scale, logging
+from ...utils import apply_lora_scale, logging, USE_PEFT_BACKEND, scale_lora_layers, unscale_lora_layers
 from ...utils.torch_utils import maybe_allow_in_graph
 from ..attention import AttentionMixin, FeedForward, JointTransformerBlock
 from ..attention_processor import (

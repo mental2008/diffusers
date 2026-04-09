@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Union, Optional, Dict, Tuple
+
 
 import torch
 from torch import nn

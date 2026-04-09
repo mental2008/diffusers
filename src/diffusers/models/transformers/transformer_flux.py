@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import inspect
-from typing import Any
+from typing import Any, Optional, Dict
 
 import numpy as np
 import torch
@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import FluxTransformer2DLoadersMixin, FromOriginalModelMixin, PeftAdapterMixin
-from ...utils import apply_lora_scale, logging
+from ...utils import apply_lora_scale, logging, USE_PEFT_BACKEND, scale_lora_layers, unscale_lora_layers
 from ...utils.torch_utils import maybe_allow_in_graph
 from .._modeling_parallel import ContextParallelInput, ContextParallelOutput
 from ..attention import AttentionMixin, AttentionModuleMixin, FeedForward
@@ -37,7 +37,6 @@ from ..embeddings import (
 from ..modeling_outputs import Transformer2DModelOutput
 from ..modeling_utils import ModelMixin, get_lazy_tensor
 from ..normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
-
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
