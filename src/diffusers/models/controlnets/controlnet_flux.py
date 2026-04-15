@@ -21,9 +21,13 @@ import torch.nn as nn
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import PeftAdapterMixin
 from ...utils import (
+    USE_PEFT_BACKEND,
     BaseOutput,
-    apply_lora_scale,
     logging,
+    is_torch_version,
+    apply_lora_scale,
+    scale_lora_layers,
+    unscale_lora_layers,
 )
 from ..attention import AttentionMixin
 from ..controlnets.controlnet import ControlNetConditioningEmbedding, zero_module
@@ -227,7 +231,6 @@ class FluxControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, PeftAdapterMi
             controlnet_cond = controlnet_cond.permute(0, 2, 4, 1, 3, 5)
             controlnet_cond = controlnet_cond.reshape(batch_size, height * width, -1)
         # add
-        print(f"hidden_states shape: {hidden_states.shape} controlnet_cond shape: {controlnet_cond.shape} self.controlnet_x_embedder shape: {self.controlnet_x_embedder.weight.shape}")
         hidden_states = hidden_states + self.controlnet_x_embedder(controlnet_cond)
 
         timestep = timestep.to(hidden_states.dtype) * 1000

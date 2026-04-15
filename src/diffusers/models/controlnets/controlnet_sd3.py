@@ -22,7 +22,14 @@ import torch.nn as nn
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import FromOriginalModelMixin, PeftAdapterMixin
-from ...utils import apply_lora_scale, logging
+from ...utils import (
+    USE_PEFT_BACKEND,
+    BaseOutput,
+    logging,
+    is_torch_version,
+    apply_lora_scale,
+    scale_lora_layers,
+)
 from ..attention import AttentionMixin, JointTransformerBlock
 from ..attention_processor import Attention, FusedJointAttnProcessor2_0
 from ..embeddings import CombinedTimestepTextProjEmbeddings, PatchEmbed
