@@ -167,7 +167,12 @@ def load_state_dict(
     try:
         file_extension = os.path.basename(checkpoint_file).split(".")[-1]
         use_pin_memory = os.environ.get("USE_PIN_MEMORY", "false").lower() == 'true'
+        use_dummy_weights = os.environ.get("DUMMY_WEIGHTS", "0") == "1"
         if file_extension == SAFETENSORS_FILE_EXTENSION:
+            if use_dummy_weights:
+                # Dummy mode: build state_dict from cached metadata (or safetensors header on cache miss)
+                from diffusionflow.patches.dummy_weights import build_dummy_state_dict
+                return build_dummy_state_dict(checkpoint_file)
             if dduf_entries:
                 # tensors are loaded on cpu
                 with dduf_entries[checkpoint_file].as_mmap() as mm:
@@ -181,14 +186,14 @@ def load_state_dict(
                         return safetensors.torch.load(mm)
             if disable_mmap:
                 tensors = safetensors.torch.load(open(checkpoint_file, "rb").read())
-                # Pin memory for faster transfer to GPU 
+                # Pin memory for faster transfer to GPU
                 if not use_pin_memory:
                     return tensors
                 for k, v in tensors.items():
                     tensors[k] = v.contiguous().pin_memory()
                     assert tensors[k].is_pinned()
-                    
-                
+
+
                 return tensors
             else:
                 tensors = safetensors.torch.load_file(checkpoint_file, device=map_location)
@@ -198,7 +203,7 @@ def load_state_dict(
                 for k, v in tensors.items():
                     tensors[k] = v.contiguous().pin_memory()
                     assert tensors[k].is_pinned()
-                    
+
 
                 return tensors
         elif file_extension == GGUF_FILE_EXTENSION:

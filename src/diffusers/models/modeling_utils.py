@@ -1705,16 +1705,19 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                 offload_index, state_dict_index, _mismatched_keys, _error_msgs = load_fn(shard_file)
                 error_msgs += _error_msgs
                 mismatched_keys += _mismatched_keys
-        # print("diffusers pinning parameters")
         import os
 
-        # if os.getenv("USE_PIN_MEMORY") == "true":
-        for name, param in model.named_parameters():
-            param.data = param.data.contiguous().pin_memory()
-            assert param.is_pinned() == True, f"Parameter {name} is not pinned"
-        for name, buffer in model.named_buffers():
-            buffer.data = buffer.data.contiguous().pin_memory()
-            assert buffer.is_pinned() == True, f"Buffer {name} is not pinned"
+        if os.environ.get("DUMMY_WEIGHTS", "0") != "1":
+            for name, param in model.named_parameters():
+                if param.is_meta or not param.is_cpu:
+                    continue
+                if not param.is_pinned():
+                    param.data = param.data.contiguous().pin_memory()
+            for name, buffer in model.named_buffers():
+                if buffer.is_meta or not buffer.is_cpu:
+                    continue
+                if not buffer.is_pinned():
+                    buffer.data = buffer.data.contiguous().pin_memory()
 
         empty_device_cache()
 
