@@ -486,8 +486,11 @@ class LazyPrefetchGroupOffloadingHook(ModelHook):
             if group_offloading_hook is not None:
                 # For the first forward pass, we have to load in a blocking manner
                 group_offloading_hook.group.non_blocking = False
-                layer_tracker_hook = LayerExecutionTrackerHook(make_execution_order_update_callback(name, submodule))
-                registry.register_hook(layer_tracker_hook, _LAYER_EXECUTION_TRACKER)
+                # Guard: a submodule shared by multiple pipeline components may have
+                # already been registered by an earlier component's initialize_hook.
+                if registry.get_hook(_LAYER_EXECUTION_TRACKER) is None:
+                    layer_tracker_hook = LayerExecutionTrackerHook(make_execution_order_update_callback(name, submodule))
+                    registry.register_hook(layer_tracker_hook, _LAYER_EXECUTION_TRACKER)
                 self._layer_execution_tracker_module_names.add(name)
 
         return module
@@ -940,8 +943,9 @@ def _apply_lazy_group_offloading_hook(
         hook = GroupOffloadingHook(group, config=config)
         registry.register_hook(hook, _GROUP_OFFLOADING)
 
-    lazy_prefetch_hook = LazyPrefetchGroupOffloadingHook()
-    registry.register_hook(lazy_prefetch_hook, _LAZY_PREFETCH_GROUP_OFFLOADING)
+    if registry.get_hook(_LAZY_PREFETCH_GROUP_OFFLOADING) is None:
+        lazy_prefetch_hook = LazyPrefetchGroupOffloadingHook()
+        registry.register_hook(lazy_prefetch_hook, _LAZY_PREFETCH_GROUP_OFFLOADING)
 
 
 def _gather_parameters_with_no_group_offloading_parent(

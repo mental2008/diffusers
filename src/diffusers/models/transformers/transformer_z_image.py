@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import math
+import os
+import time
 
 import torch
 import torch.nn as nn
@@ -22,7 +24,14 @@ from torch.nn.utils.rnn import pad_sequence
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import FromOriginalModelMixin, PeftAdapterMixin
 from ...models.attention_processor import Attention
-from ...models.modeling_utils import ModelMixin
+from ...models.modeling_utils import ModelMixin, get_lazy_tensor
+
+_ZIMAGE_PROFILE = os.environ.get("ZIMAGE_PROFILE", "0") == "1"
+_ZIMAGE_TX_STEP_COUNTER = [0]
+
+# Block-level (attn/ffn) profile, sampled on layer_id 0 and a mid layer.
+_ZIMAGE_BLOCK_PROFILE = os.environ.get("ZIMAGE_BLOCK_PROFILE", "0") == "1"
+_ZIMAGE_TX_BLOCK_COUNTER = {}  # layer_id -> int
 from ...models.normalization import RMSNorm
 from ...utils.torch_utils import maybe_allow_in_graph
 from ..attention_dispatch import dispatch_attention_fn
@@ -261,14 +270,34 @@ class ZImageTransformerBlock(nn.Module):
                 gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
                 scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
 
+            _bp = _ZIMAGE_BLOCK_PROFILE and self.layer_id in (0, 14)
+            if _bp:
+                _ZIMAGE_TX_BLOCK_COUNTER[self.layer_id] = _ZIMAGE_TX_BLOCK_COUNTER.get(self.layer_id, 0) + 1
+                _bp_cnt = _ZIMAGE_TX_BLOCK_COUNTER[self.layer_id]
+                _bp_print = _bp_cnt % 50 == 5  # print once per ~50 steps
+                torch.cuda.synchronize()
+                _t_attn_in = time.perf_counter()
             # Attention block
             attn_out = self.attention(
                 self.attention_norm1(x) * scale_msa, attention_mask=attn_mask, freqs_cis=freqs_cis
             )
+            if _bp:
+                torch.cuda.synchronize()
+                _t_attn_out = time.perf_counter()
             x = x + gate_msa * self.attention_norm2(attn_out)
 
             # FFN block
             x = x + gate_mlp * self.ffn_norm2(self.feed_forward(self.ffn_norm1(x) * scale_mlp))
+            if _bp:
+                torch.cuda.synchronize()
+                _t_ffn_out = time.perf_counter()
+                if _bp_print:
+                    print(
+                        f"[ZIMAGE_TX_BLOCK layer={self.layer_id} cnt={_bp_cnt}] "
+                        f"x_shape={tuple(x.shape)} attn={(_t_attn_out-_t_attn_in)*1000:.2f}ms "
+                        f"ffn+rest={(_t_ffn_out-_t_attn_out)*1000:.2f}ms",
+                        flush=True,
+                    )
         else:
             # Attention block
             attn_out = self.attention(self.attention_norm1(x), attention_mask=attn_mask, freqs_cis=freqs_cis)
@@ -889,6 +918,203 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOr
             ]
 
         return unified, unified_freqs, attn_mask, noise_mask_tensor
+
+    def stream_forward(
+        self,
+        x: list[torch.Tensor, list[list[torch.Tensor]]],
+        t,
+        cap_feats: list[torch.Tensor, list[list[torch.Tensor]]],
+        return_dict: bool = True,
+        controlnet_block_samples: dict[int, torch.Tensor] | None = None,
+        siglip_feats: list[list[torch.Tensor]] | None = None,
+        image_noise_mask: list[list[int]] | None = None,
+        patch_size: int = 2,
+        f_patch_size: int = 1,
+    ):
+        """
+        DiffusionFlow Katz-style streaming variant of forward. Identical except
+        the controlnet injection point resolves entries via get_lazy_tensor so
+        a producer's tensor can arrive at use-time (per-layer) instead of all
+        outputs being eagerly resolved before transformer compute starts.
+        Diffusers' monolithic pipeline keeps using `forward` unchanged.
+        """
+        _prof = _ZIMAGE_PROFILE
+        if _prof:
+            torch.cuda.synchronize()
+            _t_enter = time.perf_counter()
+            _ZIMAGE_TX_STEP_COUNTER[0] += 1
+            _step_id = _ZIMAGE_TX_STEP_COUNTER[0]
+            _wait_times = []  # per-injection get_lazy_tensor block times
+            _first_layer_wall = [None]  # capture layer 0 wall time
+            _all_layers_wall = [None]
+        assert patch_size in self.all_patch_size and f_patch_size in self.all_f_patch_size
+        omni_mode = isinstance(x[0], list)
+        device = x[0][-1].device if omni_mode else x[0].device
+
+        if omni_mode:
+            t_noisy = self.t_embedder(t * self.t_scale).type_as(x[0][-1])
+            t_clean = self.t_embedder(torch.ones_like(t) * self.t_scale).type_as(x[0][-1])
+            adaln_input = None
+        else:
+            adaln_input = self.t_embedder(t * self.t_scale).type_as(x[0])
+            t_noisy = t_clean = None
+
+        if omni_mode:
+            (
+                x,
+                cap_feats,
+                siglip_feats,
+                x_size,
+                x_pos_ids,
+                cap_pos_ids,
+                siglip_pos_ids,
+                x_pad_mask,
+                cap_pad_mask,
+                siglip_pad_mask,
+                x_pos_offsets,
+                x_noise_mask,
+                cap_noise_mask,
+                siglip_noise_mask,
+            ) = self.patchify_and_embed_omni(x, cap_feats, siglip_feats, patch_size, f_patch_size, image_noise_mask)
+        else:
+            (
+                x,
+                cap_feats,
+                x_size,
+                x_pos_ids,
+                cap_pos_ids,
+                x_pad_mask,
+                cap_pad_mask,
+            ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
+            x_pos_offsets = x_noise_mask = cap_noise_mask = siglip_noise_mask = None
+        x_seqlens = [len(xi) for xi in x]
+        x = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](torch.cat(x, dim=0))
+        x, x_freqs, x_mask, _, x_noise_tensor = self._prepare_sequence(
+            list(x.split(x_seqlens, dim=0)), x_pos_ids, x_pad_mask, self.x_pad_token, x_noise_mask, device
+        )
+
+        for layer in self.noise_refiner:
+            x = (
+                self._gradient_checkpointing_func(
+                    layer, x, x_mask, x_freqs, adaln_input, x_noise_tensor, t_noisy, t_clean
+                )
+                if torch.is_grad_enabled() and self.gradient_checkpointing
+                else layer(x, x_mask, x_freqs, adaln_input, x_noise_tensor, t_noisy, t_clean)
+            )
+
+        cap_seqlens = [len(ci) for ci in cap_feats]
+        cap_feats = self.cap_embedder(torch.cat(cap_feats, dim=0))
+        cap_feats, cap_freqs, cap_mask, _, _ = self._prepare_sequence(
+            list(cap_feats.split(cap_seqlens, dim=0)), cap_pos_ids, cap_pad_mask, self.cap_pad_token, None, device
+        )
+
+        for layer in self.context_refiner:
+            cap_feats = (
+                self._gradient_checkpointing_func(layer, cap_feats, cap_mask, cap_freqs)
+                if torch.is_grad_enabled() and self.gradient_checkpointing
+                else layer(cap_feats, cap_mask, cap_freqs)
+            )
+
+        siglip_seqlens = siglip_freqs = None
+        if omni_mode and siglip_feats[0] is not None and self.siglip_embedder is not None:
+            siglip_seqlens = [len(si) for si in siglip_feats]
+            siglip_feats = self.siglip_embedder(torch.cat(siglip_feats, dim=0))
+            siglip_feats, siglip_freqs, siglip_mask, _, _ = self._prepare_sequence(
+                list(siglip_feats.split(siglip_seqlens, dim=0)),
+                siglip_pos_ids,
+                siglip_pad_mask,
+                self.siglip_pad_token,
+                None,
+                device,
+            )
+
+            for layer in self.siglip_refiner:
+                siglip_feats = (
+                    self._gradient_checkpointing_func(layer, siglip_feats, siglip_mask, siglip_freqs)
+                    if torch.is_grad_enabled() and self.gradient_checkpointing
+                    else layer(siglip_feats, siglip_mask, siglip_freqs)
+                )
+
+        unified, unified_freqs, unified_mask, unified_noise_tensor = self._build_unified_sequence(
+            x,
+            x_freqs,
+            x_seqlens,
+            x_noise_mask,
+            cap_feats,
+            cap_freqs,
+            cap_seqlens,
+            cap_noise_mask,
+            siglip_feats,
+            siglip_freqs,
+            siglip_seqlens,
+            siglip_noise_mask,
+            omni_mode,
+            device,
+        )
+
+        if _prof:
+            torch.cuda.synchronize()
+            _t_setup_done = time.perf_counter()
+
+        for layer_idx, layer in enumerate(self.layers):
+            unified = (
+                self._gradient_checkpointing_func(
+                    layer, unified, unified_mask, unified_freqs, adaln_input, unified_noise_tensor, t_noisy, t_clean
+                )
+                if torch.is_grad_enabled() and self.gradient_checkpointing
+                else layer(unified, unified_mask, unified_freqs, adaln_input, unified_noise_tensor, t_noisy, t_clean)
+            )
+            if _prof and layer_idx == 0:
+                torch.cuda.synchronize()
+                _first_layer_wall[0] = time.perf_counter()
+            if controlnet_block_samples is not None and layer_idx in controlnet_block_samples:
+                if _prof:
+                    torch.cuda.synchronize()
+                    _t_before_get = time.perf_counter()
+                    _resolved = get_lazy_tensor(controlnet_block_samples[layer_idx])
+                    torch.cuda.synchronize()
+                    _wait_times.append((layer_idx, time.perf_counter() - _t_before_get))
+                    unified = unified + _resolved
+                else:
+                    unified = unified + get_lazy_tensor(controlnet_block_samples[layer_idx])
+
+        if _prof:
+            torch.cuda.synchronize()
+            _all_layers_wall[0] = time.perf_counter()
+
+        unified = (
+            self.all_final_layer[f"{patch_size}-{f_patch_size}"](
+                unified, noise_mask=unified_noise_tensor, c_noisy=t_noisy, c_clean=t_clean
+            )
+            if omni_mode
+            else self.all_final_layer[f"{patch_size}-{f_patch_size}"](unified, c=adaln_input)
+        )
+
+        x = self.unpatchify(list(unified.unbind(dim=0)), x_size, patch_size, f_patch_size, x_pos_offsets)
+
+        if _prof:
+            torch.cuda.synchronize()
+            _t_done = time.perf_counter()
+            _wait_total = sum(w for _, w in _wait_times)
+            _setup = _t_setup_done - _t_enter
+            _layer0 = (_first_layer_wall[0] - _t_setup_done) if _first_layer_wall[0] else 0.0
+            _rest = (_all_layers_wall[0] - _first_layer_wall[0]) if _first_layer_wall[0] else 0.0
+            _final = _t_done - _all_layers_wall[0] if _all_layers_wall[0] else 0.0
+            _wait_at_first = _wait_times[0][1] if _wait_times else 0.0
+            print(
+                f"[ZIMAGE_TX step={_step_id}] "
+                f"setup={_setup*1000:.1f}ms "
+                f"layer0={_layer0*1000:.1f}ms "
+                f"main_loop_total={_rest*1000:.1f}ms "
+                f"final+unpatchify={_final*1000:.1f}ms "
+                f"wait_total={_wait_total*1000:.1f}ms "
+                f"wait_at_inject_0={_wait_at_first*1000:.1f}ms "
+                f"num_waits={len(_wait_times)} "
+                f"total={(_t_done-_t_enter)*1000:.1f}ms",
+                flush=True,
+            )
+
+        return (x,) if not return_dict else Transformer2DModelOutput(sample=x)
 
     def forward(
         self,

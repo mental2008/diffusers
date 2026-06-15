@@ -19,6 +19,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
+import os
+import time
+
+_ZIMAGE_CN_PROFILE = os.environ.get("ZIMAGE_PROFILE", "0") == "1"
+_ZIMAGE_CN_STEP_COUNTER = [0]
+
+# Block-level (attn/ffn) profile inside control_layers.
+_ZIMAGE_CN_BLOCK_PROFILE = os.environ.get("ZIMAGE_BLOCK_PROFILE", "0") == "1"
+_ZIMAGE_CN_BLOCK_COUNTER = {}  # block_id -> int
+# Opt-in: re-add a batch dim around attention/FFN to test if the unbinded
+# (seq, dim) input is dropping us into a slow attention codepath.
+_ZIMAGE_CN_FIX_BATCH_DIM = os.environ.get("ZIMAGE_CN_FIX_BATCH_DIM", "0") == "1"
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import PeftAdapterMixin
@@ -399,6 +411,20 @@ class ZImageControlTransformerBlock(nn.Module):
             all_c = list(torch.unbind(c))
             c = all_c.pop(-1)
 
+        # Opt-in fix: after pop, c is shape (seq, dim) (no batch dim). TX block
+        # gets (bsz=1, seq, dim). The shape difference may push CN into a slow
+        # attention codepath. Add batch dim back so the attention/FFN see the
+        # same shape TX does.
+        _fix_bdim = _ZIMAGE_CN_FIX_BATCH_DIM and c.dim() == 2
+        if _fix_bdim:
+            c = c.unsqueeze(0)
+
+        _bp = _ZIMAGE_CN_BLOCK_PROFILE and self.block_id in (0, 14)
+        if _bp:
+            _ZIMAGE_CN_BLOCK_COUNTER[self.block_id] = _ZIMAGE_CN_BLOCK_COUNTER.get(self.block_id, 0) + 1
+            _bp_cnt = _ZIMAGE_CN_BLOCK_COUNTER[self.block_id]
+            _bp_print = _bp_cnt % 50 == 5
+
         # Compared to `ZImageTransformerBlock` x -> c
         if self.modulation:
             assert adaln_input is not None
@@ -406,14 +432,31 @@ class ZImageControlTransformerBlock(nn.Module):
             gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
             scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
 
+            if _bp:
+                torch.cuda.synchronize()
+                _t_attn_in = time.perf_counter()
             # Attention block
             attn_out = self.attention(
                 self.attention_norm1(c) * scale_msa, attention_mask=attn_mask, freqs_cis=freqs_cis
             )
+            if _bp:
+                torch.cuda.synchronize()
+                _t_attn_out = time.perf_counter()
             c = c + gate_msa * self.attention_norm2(attn_out)
 
             # FFN block
             c = c + gate_mlp * self.ffn_norm2(self.feed_forward(self.ffn_norm1(c) * scale_mlp))
+            if _bp:
+                torch.cuda.synchronize()
+                _t_ffn_out = time.perf_counter()
+                if _bp_print:
+                    print(
+                        f"[ZIMAGE_CN_BLOCK block_id={self.block_id} cnt={_bp_cnt} "
+                        f"fix_bdim={_fix_bdim}] "
+                        f"c_shape={tuple(c.shape)} attn={(_t_attn_out-_t_attn_in)*1000:.2f}ms "
+                        f"ffn+rest={(_t_ffn_out-_t_attn_out)*1000:.2f}ms",
+                        flush=True,
+                    )
         else:
             # Attention block
             attn_out = self.attention(self.attention_norm1(c), attention_mask=attn_mask, freqs_cis=freqs_cis)
@@ -421,6 +464,11 @@ class ZImageControlTransformerBlock(nn.Module):
 
             # FFN block
             c = c + self.ffn_norm2(self.feed_forward(self.ffn_norm1(c)))
+
+        # Undo the batch-dim fix before the stack/unbind passthrough, so the
+        # outer machinery still sees the (seq, dim) layout it expects.
+        if _fix_bdim:
+            c = c.squeeze(0)
 
         # Control
         c_skip = self.after_proj(c)
@@ -650,6 +698,240 @@ class ZImageControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
             all_image_out.append(image_padded_feat)
 
         return all_image_out
+
+    def yield_controlnet_block_samples(
+        self,
+        x: list[torch.Tensor],
+        t,
+        cap_feats: list[torch.Tensor],
+        control_context: list[torch.Tensor],
+        conditioning_scale: float = 1.0,
+        patch_size=2,
+        f_patch_size=1,
+    ):
+        """
+        DiffusionFlow Katz-style streaming variant of forward. Body matches
+        forward up to the `control_layers` loop; instead of running the loop
+        to completion and then returning a dict of all 15 hints, this yields
+        `{f"controlnet_block_sample_{layer_idx}": c_skip}` after each
+        `control_layers` iteration. ZImageControlTransformerBlock stacks
+        [c_skip, c] at each call, so the newly-produced hint is at [-2] of
+        the unbinded stacked tensor (the last is the working c passed to the
+        next layer).
+
+        The DiffusionFlow worker's generator-execute path publishes each
+        yielded tensor into nvshmem as it is produced, letting the downstream
+        transformer's stream_forward unblock at its corresponding injection
+        point earlier than waiting for all 15 hints together.
+        """
+        _prof = _ZIMAGE_CN_PROFILE
+        if _prof:
+            torch.cuda.synchronize()
+            _t_enter = time.perf_counter()
+            _ZIMAGE_CN_STEP_COUNTER[0] += 1
+            _step_id = _ZIMAGE_CN_STEP_COUNTER[0]
+            _per_layer_times = []
+        if (
+            self.t_scale is None
+            or self.t_embedder is None
+            or self.all_x_embedder is None
+            or self.cap_embedder is None
+            or self.rope_embedder is None
+            or self.noise_refiner is None
+            or self.context_refiner is None
+            or self.x_pad_token is None
+            or self.cap_pad_token is None
+        ):
+            raise ValueError(
+                "Required modules are `None`, use `from_transformer` to share required modules from `transformer`."
+            )
+
+        assert patch_size in self.config.all_patch_size
+        assert f_patch_size in self.config.all_f_patch_size
+
+        bsz = len(x)
+        device = x[0].device
+        t = t * self.t_scale
+        t = self.t_embedder(t)
+
+        (
+            x,
+            cap_feats,
+            x_size,
+            x_pos_ids,
+            cap_pos_ids,
+            x_inner_pad_mask,
+            cap_inner_pad_mask,
+        ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
+
+        x_item_seqlens = [len(_) for _ in x]
+        assert all(_ % SEQ_MULTI_OF == 0 for _ in x_item_seqlens)
+        x_max_item_seqlen = max(x_item_seqlens)
+
+        control_context = self.patchify(control_context, patch_size, f_patch_size)
+        control_context = torch.cat(control_context, dim=0)
+        control_context = self.control_all_x_embedder[f"{patch_size}-{f_patch_size}"](control_context)
+
+        control_context[torch.cat(x_inner_pad_mask)] = self.x_pad_token
+        control_context = list(control_context.split(x_item_seqlens, dim=0))
+
+        control_context = pad_sequence(control_context, batch_first=True, padding_value=0.0)
+
+        x = torch.cat(x, dim=0)
+        x = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](x)
+
+        adaln_input = t.type_as(x)
+        x[torch.cat(x_inner_pad_mask)] = self.x_pad_token
+        x = list(x.split(x_item_seqlens, dim=0))
+        x_freqs_cis = list(self.rope_embedder(torch.cat(x_pos_ids, dim=0)).split([len(_) for _ in x_pos_ids], dim=0))
+
+        x = pad_sequence(x, batch_first=True, padding_value=0.0)
+        x_freqs_cis = pad_sequence(x_freqs_cis, batch_first=True, padding_value=0.0)
+        x_freqs_cis = x_freqs_cis[:, : x.shape[1]]
+
+        x_attn_mask = torch.zeros((bsz, x_max_item_seqlen), dtype=torch.bool, device=device)
+        for i, seq_len in enumerate(x_item_seqlens):
+            x_attn_mask[i, :seq_len] = 1
+
+        if self.add_control_noise_refiner is not None:
+            if self.add_control_noise_refiner == "control_layers":
+                layers = self.control_layers
+            elif self.add_control_noise_refiner == "control_noise_refiner":
+                layers = self.control_noise_refiner
+            else:
+                raise ValueError(f"Unsupported `add_control_noise_refiner` type: {self.add_control_noise_refiner}.")
+            for layer in layers:
+                if torch.is_grad_enabled() and self.gradient_checkpointing:
+                    control_context = self._gradient_checkpointing_func(
+                        layer, control_context, x, x_attn_mask, x_freqs_cis, adaln_input
+                    )
+                else:
+                    control_context = layer(control_context, x, x_attn_mask, x_freqs_cis, adaln_input)
+
+            hints = torch.unbind(control_context)[:-1]
+            control_context = torch.unbind(control_context)[-1]
+            noise_refiner_block_samples = {
+                layer_idx: hints[idx] * conditioning_scale
+                for idx, layer_idx in enumerate(self.control_refiner_layers_places)
+            }
+        else:
+            noise_refiner_block_samples = None
+
+        if torch.is_grad_enabled() and self.gradient_checkpointing:
+            for layer_idx, layer in enumerate(self.noise_refiner):
+                x = self._gradient_checkpointing_func(layer, x, x_attn_mask, x_freqs_cis, adaln_input)
+                if noise_refiner_block_samples is not None:
+                    if layer_idx in noise_refiner_block_samples:
+                        x = x + noise_refiner_block_samples[layer_idx]
+        else:
+            for layer_idx, layer in enumerate(self.noise_refiner):
+                x = layer(x, x_attn_mask, x_freqs_cis, adaln_input)
+                if noise_refiner_block_samples is not None:
+                    if layer_idx in noise_refiner_block_samples:
+                        x = x + noise_refiner_block_samples[layer_idx]
+
+        cap_item_seqlens = [len(_) for _ in cap_feats]
+        cap_max_item_seqlen = max(cap_item_seqlens)
+
+        cap_feats = torch.cat(cap_feats, dim=0)
+        cap_feats = self.cap_embedder(cap_feats)
+        cap_feats[torch.cat(cap_inner_pad_mask)] = self.cap_pad_token
+        cap_feats = list(cap_feats.split(cap_item_seqlens, dim=0))
+        cap_freqs_cis = list(
+            self.rope_embedder(torch.cat(cap_pos_ids, dim=0)).split([len(_) for _ in cap_pos_ids], dim=0)
+        )
+
+        cap_feats = pad_sequence(cap_feats, batch_first=True, padding_value=0.0)
+        cap_freqs_cis = pad_sequence(cap_freqs_cis, batch_first=True, padding_value=0.0)
+        cap_freqs_cis = cap_freqs_cis[:, : cap_feats.shape[1]]
+
+        cap_attn_mask = torch.zeros((bsz, cap_max_item_seqlen), dtype=torch.bool, device=device)
+        for i, seq_len in enumerate(cap_item_seqlens):
+            cap_attn_mask[i, :seq_len] = 1
+
+        if torch.is_grad_enabled() and self.gradient_checkpointing:
+            for layer in self.context_refiner:
+                cap_feats = self._gradient_checkpointing_func(layer, cap_feats, cap_attn_mask, cap_freqs_cis)
+        else:
+            for layer in self.context_refiner:
+                cap_feats = layer(cap_feats, cap_attn_mask, cap_freqs_cis)
+
+        unified = []
+        unified_freqs_cis = []
+        for i in range(bsz):
+            x_len = x_item_seqlens[i]
+            cap_len = cap_item_seqlens[i]
+            unified.append(torch.cat([x[i][:x_len], cap_feats[i][:cap_len]]))
+            unified_freqs_cis.append(torch.cat([x_freqs_cis[i][:x_len], cap_freqs_cis[i][:cap_len]]))
+        unified_item_seqlens = [a + b for a, b in zip(cap_item_seqlens, x_item_seqlens)]
+        assert unified_item_seqlens == [len(_) for _ in unified]
+        unified_max_item_seqlen = max(unified_item_seqlens)
+
+        unified = pad_sequence(unified, batch_first=True, padding_value=0.0)
+        unified_freqs_cis = pad_sequence(unified_freqs_cis, batch_first=True, padding_value=0.0)
+        unified_attn_mask = torch.zeros((bsz, unified_max_item_seqlen), dtype=torch.bool, device=device)
+        for i, seq_len in enumerate(unified_item_seqlens):
+            unified_attn_mask[i, :seq_len] = 1
+
+        if not self.add_control_noise_refiner:
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+                for layer in self.control_noise_refiner:
+                    control_context = self._gradient_checkpointing_func(
+                        layer, control_context, x_attn_mask, x_freqs_cis, adaln_input
+                    )
+            else:
+                for layer in self.control_noise_refiner:
+                    control_context = layer(control_context, x_attn_mask, x_freqs_cis, adaln_input)
+
+        control_context_unified = []
+        for i in range(bsz):
+            x_len = x_item_seqlens[i]
+            cap_len = cap_item_seqlens[i]
+            control_context_unified.append(torch.cat([control_context[i][:x_len], cap_feats[i][:cap_len]]))
+        control_context_unified = pad_sequence(control_context_unified, batch_first=True, padding_value=0.0)
+
+        if _prof:
+            torch.cuda.synchronize()
+            _t_setup_done = time.perf_counter()
+
+        # Streaming control_layers loop — yield each layer's hint immediately.
+        for idx, layer in enumerate(self.control_layers):
+            if _prof:
+                torch.cuda.synchronize()
+                _t_layer_start = time.perf_counter()
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+                control_context_unified = self._gradient_checkpointing_func(
+                    layer, control_context_unified, unified, unified_attn_mask, unified_freqs_cis, adaln_input
+                )
+            else:
+                control_context_unified = layer(
+                    control_context_unified, unified, unified_attn_mask, unified_freqs_cis, adaln_input
+                )
+            # ZImageControlTransformerBlock appends [c_skip, c] and stacks; [-2]
+            # is this layer's hint, [-1] is the working c for the next layer.
+            c_skip_this = torch.unbind(control_context_unified)[-2] * conditioning_scale
+            if _prof:
+                torch.cuda.synchronize()
+                _per_layer_times.append(time.perf_counter() - _t_layer_start)
+            yield {
+                f"controlnet_block_sample_{self.control_layers_places[idx]}": c_skip_this
+            }
+
+        if _prof:
+            torch.cuda.synchronize()
+            _t_done = time.perf_counter()
+            _setup_ms = (_t_setup_done - _t_enter) * 1000
+            _layer_ms_str = ",".join(f"{t*1000:.1f}" for t in _per_layer_times)
+            _layer_total_ms = sum(_per_layer_times) * 1000
+            print(
+                f"[ZIMAGE_CN step={_step_id}] "
+                f"setup={_setup_ms:.1f}ms "
+                f"first_yield_at={(_t_setup_done - _t_enter + _per_layer_times[0])*1000:.1f}ms "
+                f"control_layers_total={_layer_total_ms:.1f}ms "
+                f"per_layer=[{_layer_ms_str}] "
+                f"total={(_t_done-_t_enter)*1000:.1f}ms",
+                flush=True,
+            )
 
     def forward(
         self,

@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import inspect
+import os
+import time
 from typing import Any, Callable
 
 import torch
@@ -487,6 +489,8 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
         self._num_timesteps = len(timesteps)
 
         # 6. Denoising loop
+        _dflow_timing = os.environ.get("DFLOW_TIMING")
+        _dflow_acc = {"xf": 0.0, "rest": 0.0, "n": 0}
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -524,9 +528,18 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
                 latent_model_input = latent_model_input.unsqueeze(2)
                 latent_model_input_list = list(latent_model_input.unbind(dim=0))
 
+                if _dflow_timing:
+                    torch.cuda.synchronize()
+                    _t_xf0 = time.perf_counter()
+
                 model_out_list = self.transformer(
                     latent_model_input_list, timestep_model_input, prompt_embeds_model_input, return_dict=False
                 )[0]
+
+                if _dflow_timing:
+                    torch.cuda.synchronize()
+                    _t_xf1 = time.perf_counter()
+                    _dflow_acc["xf"] += _t_xf1 - _t_xf0
 
                 if apply_cfg:
                     # Perform CFG
@@ -561,6 +574,11 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
                 latents = self.scheduler.step(noise_pred.to(torch.float32), t, latents, return_dict=False)[0]
                 assert latents.dtype == torch.float32
 
+                if _dflow_timing:
+                    torch.cuda.synchronize()
+                    _dflow_acc["rest"] += time.perf_counter() - _t_xf1
+                    _dflow_acc["n"] += 1
+
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
                     for k in callback_on_step_end_tensor_inputs:
@@ -574,6 +592,16 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
+
+        if _dflow_timing and _dflow_acc["n"] > 0:
+            _n = _dflow_acc["n"]
+            print(
+                f"[DFLOW_TIMING] denoise steps={_n}  "
+                f"transformer={_dflow_acc['xf']:.3f}s ({1000*_dflow_acc['xf']/_n:.1f}ms/step)  "
+                f"rest(cfg+sched)={_dflow_acc['rest']:.3f}s ({1000*_dflow_acc['rest']/_n:.1f}ms/step)  "
+                f"sum={_dflow_acc['xf']+_dflow_acc['rest']:.3f}s",
+                flush=True,
+            )
 
         if output_type == "latent":
             image = latents
