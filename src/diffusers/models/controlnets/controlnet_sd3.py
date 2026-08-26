@@ -26,7 +26,7 @@ from ..attention import AttentionMixin, JointTransformerBlock
 from ..attention_processor import Attention, FusedJointAttnProcessor2_0
 from ..embeddings import CombinedTimestepTextProjEmbeddings, PatchEmbed
 from ..modeling_outputs import Transformer2DModelOutput
-from ..modeling_utils import ModelMixin
+from ..modeling_utils import ModelMixin, apply_lora_scale_to_generator
 from ..transformers.transformer_sd3 import SD3SingleTransformerBlock
 from .controlnet import BaseOutput, zero_module
 
@@ -269,31 +269,18 @@ class SD3ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, PeftAdapterMix
 
         return controlnet
 
+    @apply_lora_scale_to_generator("joint_attention_kwargs")
     def yield_controlnet_block_samples(
         self,
-        hidden_states: torch.FloatTensor,
+        hidden_states: torch.Tensor,
         controlnet_cond: torch.Tensor,
         conditioning_scale: float = 1.0,
-        encoder_hidden_states: torch.FloatTensor = None,
-        pooled_projections: torch.FloatTensor = None,
+        encoder_hidden_states: torch.Tensor = None,
+        pooled_projections: torch.Tensor = None,
         timestep: torch.LongTensor = None,
-        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        joint_attention_kwargs: dict[str, Any] | None = None,
     ):
-        if joint_attention_kwargs is not None:
-            joint_attention_kwargs = joint_attention_kwargs.copy()
-            lora_scale = joint_attention_kwargs.pop("scale", 1.0)
-        else:
-            lora_scale = 1.0
-
-        if USE_PEFT_BACKEND:
-            # weight the lora layers by setting `lora_scale` for each PEFT layer
-            scale_lora_layers(self, lora_scale)
-        else:
-            if joint_attention_kwargs is not None and joint_attention_kwargs.get("scale", None) is not None:
-                logger.warning(
-                    "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
-                )
-
+        """Yield DiFlow residual dictionaries while retaining upstream model semantics."""
         if self.pos_embed is not None and hidden_states.ndim != 4:
             raise ValueError("hidden_states must be 4D when pos_embed is used")
 
@@ -323,30 +310,16 @@ class SD3ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, PeftAdapterMix
 
         for block in self.transformer_blocks:
             if torch.is_grad_enabled() and self.gradient_checkpointing:
-
-                def create_custom_forward(module, return_dict=None):
-                    def custom_forward(*inputs):
-                        if return_dict is not None:
-                            return module(*inputs, return_dict=return_dict)
-                        else:
-                            return module(*inputs)
-
-                    return custom_forward
-
-                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
                 if self.context_embedder is not None:
-                    encoder_hidden_states, hidden_states = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(block),
+                    encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
+                        block,
                         hidden_states,
                         encoder_hidden_states,
                         temb,
-                        **ckpt_kwargs,
                     )
                 else:
                     # SD3.5 8b controlnet use single transformer block, which does not use `encoder_hidden_states`
-                    hidden_states = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(block), hidden_states, temb, **ckpt_kwargs
-                    )
+                    hidden_states = self._gradient_checkpointing_func(block, hidden_states, temb)
 
             else:
                 if self.context_embedder is not None:
@@ -359,11 +332,8 @@ class SD3ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, PeftAdapterMix
 
             block_res_samples = block_res_samples + (hidden_states,)
 
-        for i, (block_res_sample, controlnet_block) in enumerate(zip(block_res_samples, self.controlnet_blocks)):
-            block_res_sample = controlnet_block(block_res_sample) * conditioning_scale
-            yield {
-                f"control_block_sample_{i}": block_res_sample
-            }
+        for i, (block_sample, controlnet_block) in enumerate(zip(block_res_samples, self.controlnet_blocks)):
+            yield {f"control_block_sample_{i}": controlnet_block(block_sample) * conditioning_scale}
 
     @apply_lora_scale("joint_attention_kwargs")
     def forward(

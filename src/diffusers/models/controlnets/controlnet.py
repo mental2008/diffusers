@@ -31,7 +31,7 @@ from ..attention_processor import (
     AttnProcessor,
 )
 from ..embeddings import TextImageProjection, TextImageTimeEmbedding, TextTimeEmbedding, TimestepEmbedding, Timesteps
-from ..modeling_utils import ModelMixin
+from ..modeling_utils import ModelMixin, apply_lora_scale_to_generator
 from ..unets.unet_2d_blocks import (
     UNetMidBlock2D,
     UNetMidBlock2DCrossAttn,
@@ -599,57 +599,22 @@ class ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, FromOriginalModel
         for module in self.children():
             fn_recursive_set_attention_slice(module, reversed_slice_size)
 
+    @apply_lora_scale_to_generator("cross_attention_kwargs")
     def yield_control_block_samples(
         self,
         sample: torch.Tensor,
-        timestep: Union[torch.Tensor, float, int],
+        timestep: torch.Tensor | float | int,
         encoder_hidden_states: torch.Tensor,
         controlnet_cond: torch.Tensor,
         conditioning_scale: float = 1.0,
-        class_labels: Optional[torch.Tensor] = None,
-        timestep_cond: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
-        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        class_labels: torch.Tensor | None = None,
+        timestep_cond: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        added_cond_kwargs: dict[str, torch.Tensor] | None = None,
+        cross_attention_kwargs: dict[str, Any] | None = None,
         guess_mode: bool = False,
-    ) -> Union[ControlNetOutput, Tuple[Tuple[torch.Tensor, ...], torch.Tensor]]:
-        """
-        The [`ControlNetModel`] forward method.
-
-        Args:
-            sample (`torch.Tensor`):
-                The noisy input tensor.
-            timestep (`Union[torch.Tensor, float, int]`):
-                The number of timesteps to denoise an input.
-            encoder_hidden_states (`torch.Tensor`):
-                The encoder hidden states.
-            controlnet_cond (`torch.Tensor`):
-                The conditional input tensor of shape `(batch_size, sequence_length, hidden_size)`.
-            conditioning_scale (`float`, defaults to `1.0`):
-                The scale factor for ControlNet outputs.
-            class_labels (`torch.Tensor`, *optional*, defaults to `None`):
-                Optional class labels for conditioning. Their embeddings will be summed with the timestep embeddings.
-            timestep_cond (`torch.Tensor`, *optional*, defaults to `None`):
-                Additional conditional embeddings for timestep. If provided, the embeddings will be summed with the
-                timestep_embedding passed through the `self.time_embedding` layer to obtain the final timestep
-                embeddings.
-            attention_mask (`torch.Tensor`, *optional*, defaults to `None`):
-                An attention mask of shape `(batch, key_tokens)` is applied to `encoder_hidden_states`. If `1` the mask
-                is kept, otherwise if `0` it is discarded. Mask will be converted into a bias, which adds large
-                negative values to the attention scores corresponding to "discard" tokens.
-            added_cond_kwargs (`dict`):
-                Additional conditions for the Stable Diffusion XL UNet.
-            cross_attention_kwargs (`dict[str]`, *optional*, defaults to `None`):
-                A kwargs dictionary that if specified is passed along to the `AttnProcessor`.
-            guess_mode (`bool`, defaults to `False`):
-                In this mode, the ControlNet encoder tries its best to recognize the input content of the input even if
-                you remove all prompts. A `guidance_scale` between 3.0 and 5.0 is recommended.
-
-        Returns:
-            [`~models.controlnets.controlnet.ControlNetOutput`] **or** `tuple`:
-                a tuple is returned where the first element is the sample tensor.
-        """
-        # check channel order
+    ):
+        """Yield DiFlow residual dictionaries while retaining upstream model semantics."""
         channel_order = self.config.controlnet_conditioning_channel_order
 
         if channel_order == "rgb":
@@ -670,11 +635,9 @@ class ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, FromOriginalModel
         if not torch.is_tensor(timesteps):
             # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
             # This would be a good case for the `match` statement (Python 3.10+)
-            is_mps = sample.device.type == "mps"
-            if isinstance(timestep, float):
-                dtype = torch.float32 if is_mps else torch.float64
-            else:
-                dtype = torch.int32 if is_mps else torch.int64
+            dtype = maybe_adjust_dtype_for_device(
+                torch.float64 if isinstance(timestep, float) else torch.int64, sample.device
+            )
             timesteps = torch.tensor([timesteps], dtype=dtype, device=sample.device)
         elif len(timesteps.shape) == 0:
             timesteps = timesteps[None].to(sample.device)
@@ -761,25 +724,21 @@ class ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, FromOriginalModel
             else:
                 sample = self.mid_block(sample, emb)
 
-        # 5. Control net blocks
-
         scales = None
         if guess_mode and not self.config.global_pool_conditions:
-            scales = torch.logspace(-1, 0, len(down_block_res_samples) + 1, device=sample.device)  # 0.1 to 1.0
+            scales = torch.logspace(-1, 0, len(down_block_res_samples) + 1, device=sample.device)
             scales = scales * conditioning_scale
 
-        assert not self.config.global_pool_conditions, "global_pool_conditions must be False"
+        for i, (residual, controlnet_block) in enumerate(zip(down_block_res_samples, self.controlnet_down_blocks)):
+            residual = controlnet_block(residual) * (scales[i] if scales is not None else conditioning_scale)
+            if self.config.global_pool_conditions:
+                residual = torch.mean(residual, dim=(2, 3), keepdim=True)
+            yield {f"down_block_res_sample_{i}": residual}
 
-        for i, (down_block_res_sample, controlnet_block) in enumerate(zip(down_block_res_samples, self.controlnet_down_blocks)):
-            down_block_res_sample = controlnet_block(down_block_res_sample) * (scales[i] if scales is not None else conditioning_scale)
-            yield {
-                f"down_block_res_sample_{i}": down_block_res_sample
-            }
-
-        mid_block_res_sample = self.controlnet_mid_block(sample) * (scales[-1] if scales is not None else conditioning_scale)
-        yield {
-            "mid_block_res_sample": mid_block_res_sample
-        }
+        residual = self.controlnet_mid_block(sample) * (scales[-1] if scales is not None else conditioning_scale)
+        if self.config.global_pool_conditions:
+            residual = torch.mean(residual, dim=(2, 3), keepdim=True)
+        yield {"mid_block_res_sample": residual}
 
     @apply_lora_scale("cross_attention_kwargs")
     def forward(

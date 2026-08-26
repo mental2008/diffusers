@@ -51,6 +51,7 @@ from ..utils import (
     _add_variant,
     _get_checkpoint_shard_files,
     _get_model_file,
+    apply_lora_scale,
     deprecate,
     is_accelerate_available,
     is_bitsandbytes_available,
@@ -135,6 +136,41 @@ def get_lazy_tensor(tensor_or_callable: Any) -> torch.Tensor:
     if callable(tensor_or_callable):
         return tensor_or_callable()
     return tensor_or_callable
+
+
+def apply_lora_scale_to_generator(kwargs_name: str = "joint_attention_kwargs"):
+    """Scale each generator step, never leaving shared model weights scaled at a yield."""
+
+    def decorator(generator_fn):
+        signature = inspect.signature(generator_fn)
+
+        @functools.wraps(generator_fn)
+        def wrapper(self, *args, **kwargs):
+            arguments = signature.bind(self, *args, **kwargs)
+            attention_kwargs = arguments.arguments.get(kwargs_name)
+            if attention_kwargs is not None:
+                cleaned_kwargs = attention_kwargs.copy()
+                cleaned_kwargs.pop("scale", None)
+                arguments.arguments[kwargs_name] = cleaned_kwargs
+            generator = generator_fn(*arguments.args, **arguments.kwargs)
+
+            @apply_lora_scale(kwargs_name)
+            def advance(model, **unused):
+                return next(generator)
+
+            try:
+                while True:
+                    try:
+                        sample = advance(self, **{kwargs_name: attention_kwargs})
+                    except StopIteration:
+                        return
+                    yield sample
+            finally:
+                generator.close()
+
+        return wrapper
+
+    return decorator
 
 
 if is_accelerate_available():
